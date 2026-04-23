@@ -8,9 +8,11 @@ A lightweight network intrusion detection system (IDS) written in C using libpca
 - Detects **28 distinct threat categories** across scanning, flooding, amplification, spoofing, and application-layer attacks
 - **Any TCP port** can be watched for brute-force attempts with a custom name and threshold
 - Writes every alert to a **daily rotating log file** named `YYYYMMDD.log` in `/var/log/tigernet`
+- **Size-based log rotation** — rotates the current day's file when it exceeds a configurable MB limit
 - Fires a user-supplied **alert script** on every alert (double-forked, non-blocking)
 - Includes **`alert_udp.sh`** — a ready-made script that sends JSON over UDP to any SIEM or log collector
-- All thresholds configurable via **CLI flags** or a **config file**
+- All thresholds and detection flags configurable via **CLI flags** or a **config file**
+- Per-interface suppression of noisy detections for mixed LAN/internet setups
 
 ---
 
@@ -139,7 +141,7 @@ sudo ./tigernet [options]
 | | `--ntp-amp <n>` | NTP amplification threshold | `50` |
 | | `--ssdp-amp <n>` | SSDP amplification threshold | `50` |
 | | `--frag-flood <n>` | IP fragment flood threshold | `100` |
-| | `--no-bogon` | Disable bogon/martian/smurf checks on **all** interfaces | off |
+| | `--no-bogon` | Disable bogon/martian/smurf checks globally | off |
 | | `--internal-iface <dev>` | Suppress bogon/martian/smurf on one interface — **repeatable** | none |
 | | `--no-ack-scan` | Disable TCP ACK scan detection globally | off |
 | | `--no-fin-scan` | Disable TCP FIN scan detection globally | off |
@@ -152,6 +154,7 @@ sudo ./tigernet [options]
 | | `--watch <port:name:thr>` | Watch port for brute-force — **repeatable** | SSH:22:5, RDP:3389:5 |
 | | `--alert-script <path>` | Script executed on every alert | none |
 | | `--log-dir <dir>` | Directory for daily `YYYYMMDD.log` files | `/var/log/tigernet` |
+| | `--log-max-mb <n>` | Rotate log when it exceeds N MB; `0` disables | `0` (off) |
 | `-v` | `--verbose` | Log every packet event | off |
 | `-h` | `--help` | Show help and exit | |
 
@@ -164,21 +167,27 @@ sudo ./tigernet -i eth0
 # Monitor two interfaces simultaneously
 sudo ./tigernet -i eth0 -i eth1
 
-# Aggressive thresholds for a quiet network
-sudo ./tigernet -i eth0 -w 30 --syn-flood 20 --ping-sweep 5
-
-# Custom brute-force watch ports
-sudo ./tigernet -i eth0 \
-    --watch 22:SSH:5 \
-    --watch 3389:RDP:3 \
-    --watch 5432:PostgreSQL:10
-
-# Full setup with logging and UDP alerts
+# Rotate the log at 100 MB, send UDP alerts to a SIEM
 export TIGERNET_UDP_HOST=10.0.0.1
 export TIGERNET_UDP_PORT=5140
 sudo -E ./tigernet -i eth0 -i eth1 \
     --log-dir /var/log/tigernet \
+    --log-max-mb 100 \
     --alert-script ./alert_udp.sh
+
+# Quiet LAN-only setup — suppress false-positives
+sudo ./tigernet -i eth0 \
+    --no-bogon \
+    --no-ack-scan \
+    --no-fin-scan \
+    --no-maimon-scan
+
+# Mixed setup: full detection on eth0, suppressed on internal eth1
+sudo ./tigernet -i eth0 -i eth1 \
+    --internal-iface eth1 \
+    --iface-no-ack-scan eth1 \
+    --iface-no-fin-scan eth1 \
+    --iface-no-maimon eth1
 ```
 
 ---
@@ -305,7 +314,7 @@ Override with `--log-dir` or the `logDir` config key. The directory is created r
 
 ### Log format
 
-Tab-separated, with a header on the first line of each new file:
+Tab-separated, with a column header on the first line of each new file:
 
 ```
 # TIMESTAMP	TYPE	SRC_IP	IFACE	DETAIL
@@ -315,22 +324,59 @@ Tab-separated, with a header on the first line of each new file:
 2025-04-22T14:03:55Z	DNS AMPLIFICATION	10.0.0.9	eth0	120 UDP packets to port 53 in 10s window
 ```
 
+Timestamps are UTC ISO-8601. The tab-separated layout is easy to parse with `awk`, `cut`, `pandas`, or any log-analysis tool.
+
+### Size-based log rotation
+
+When `logMaxMb` is set to a value greater than zero, tigernet checks the current log file's size before each write. If the file meets or exceeds the limit, it is renamed before the new entry is written:
+
+```
+YYYYMMDD.log  →  YYYYMMDD_1.log
+```
+
+If `YYYYMMDD_1.log` already exists the next free suffix is used (`_2`, `_3`, …). A fresh `YYYYMMDD.log` is then started with a new column header.
+
+Enable via CLI:
+
+```bash
+# Rotate when the daily log exceeds 50 MB
+sudo ./tigernet -i eth0 --log-max-mb 50
+```
+
+Or in the config file:
+
+```ini
+logMaxMb = 50
+```
+
+Setting `logMaxMb = 0` (the default) disables size rotation and lets the daily file grow without limit. The startup banner shows the current size limit alongside the log directory.
+
 ### Querying log files
 
 ```bash
-# All alerts today
+# Follow the live log as alerts arrive
 tail -f /var/log/tigernet/$(date +%Y%m%d).log
 
-# Specific threat type
-grep 'BOGON SOURCE' /var/log/tigernet/*.log
+# All alerts of a specific type
+grep 'SSH BRUTE-FORCE' /var/log/tigernet/*.log
 
-# Alerts from one IP across all days
+# All alerts from one IP across all days and rotated files
 grep '203.0.113.7' /var/log/tigernet/*.log
 
-# Count by threat type for a day
+# Count alert types for a given day
 awk -F'\t' 'NR>1 {count[$2]++} END {for (t in count) print count[t], t}' \
     /var/log/tigernet/$(date +%Y%m%d).log | sort -rn
 ```
+
+### Disabling log files
+
+Set `logDir` to empty in the config file:
+
+```ini
+logDir =
+```
+
+If the directory cannot be created at startup, file logging is disabled gracefully and tigernet continues running.
 
 ---
 
@@ -398,7 +444,7 @@ Receive with: `socat UDP-RECV:5140 STDOUT` or `nc -u -l 5140`.
 
 ## Configuration file
 
-tigernet reads `~/.tigernet/tigernet.conf` before CLI flags. Auto-created on first run.
+tigernet reads `~/.tigernet/tigernet.conf` before CLI flags. Auto-created on first run with all keys commented out as a reference.
 
 ### Location
 
@@ -427,27 +473,28 @@ dnsAmp      = 100
 ntpAmp      = 50
 ssdpAmp     = 50
 fragFlood   = 100
-alertScript  = /etc/tigernet/alert_udp.sh
-logDir       = /var/log/tigernet
-verbose      = false
+alertScript = /etc/tigernet/alert_udp.sh
+logDir      = /var/log/tigernet
+logMaxMb    = 100
+verbose     = false
 
 # Bogon/martian/smurf suppression
 # noBogon         = false     # disable globally
-# internalIface   = eth1      # suppress bogon on one interface (repeatable)
-#
+# internalIface   = eth1      # suppress on one interface (repeatable)
+
 # Stealth-scan suppression
 # noAckScan       = false     # disable ACK scan globally
 # noFinScan       = false     # disable FIN scan globally
 # noMaimonScan    = false     # disable Maimon scan globally
 # noOsFingerprint = false     # disable OS fingerprint globally
-#
-# Per-interface stealth-scan suppression
-# ifaceNoAckScan  = eth1      # suppress ACK scan on one interface
+
+# Per-interface stealth-scan suppression (repeatable)
+# ifaceNoAckScan  = eth1
 # ifaceNoFinScan  = eth1
 # ifaceNoMaimon   = eth1
 # ifaceNoOsFp     = eth1
 
-# Brute-force watched ports — format: watch = <port>:<n>:<threshold>
+# Brute-force watched ports — format: watch = <port>:<name>:<threshold>
 watch = 22:SSH:5
 watch = 3389:RDP:5
 watch = 5900:VNC:3
@@ -482,7 +529,8 @@ watch = 5900:VNC:3
 | `ifaceNoMaimon` | string | yes | Suppress Maimon scan on a named interface |
 | `ifaceNoOsFp` | string | yes | Suppress OS fingerprint on a named interface |
 | `alertScript` | path | no | Script to execute on every alert |
-| `logDir` | path | no | Directory for daily log files |
+| `logDir` | path | no | Directory for daily log files (default: `/var/log/tigernet`) |
+| `logMaxMb` | integer | no | Rotate log when it reaches this size in MB; `0` disables |
 | `watch` | `port:name:threshold` | yes | Add or update a watched brute-force port |
 | `verbose` | boolean | no | `true`, `yes`, or `1` to enable verbose output |
 
@@ -529,6 +577,7 @@ Example output:
 | `Makefile` | Build, install, and uninstall targets |
 | `~/.tigernet/tigernet.conf` | Per-user config file (auto-created on first run) |
 | `/var/log/tigernet/YYYYMMDD.log` | Daily alert log files (default location) |
+| `/var/log/tigernet/YYYYMMDD_1.log` | Size-rotated log files (when `logMaxMb` is set) |
 
 ---
 
@@ -541,9 +590,9 @@ Example output:
 - Port tracking (TCP and UDP scan) uses a **bitset** across all 65 536 ports — O(1) per packet.
 - All per-source-IP state lives in a **hash table** (4096 buckets, chained).
 - Alert scripts run via **double-fork + `setsid()`** — never blocks, no zombies.
-- Log files are opened, written, and **closed per alert** — midnight rotation is automatic.
+- Log files are opened, written, and **closed per alert** — midnight rotation (new date → new filename) is fully automatic with no timer or signal needed.
 - **Size-based rotation**: when `logMaxMb > 0`, the file size is checked with `stat()` before each write. If the limit is met, the file is renamed `YYYYMMDD_1.log` (suffix increments until a free slot is found) and a fresh file is started — no background thread or timer needed.
-- Ctrl+C calls `pcap_breakloop()` on every open handle; all threads exit cleanly.
+- Ctrl+C calls `pcap_breakloop()` on every open handle; all threads exit cleanly before `pthread_join` collects them.
 
 ---
 
@@ -553,8 +602,7 @@ Example output:
 - Ethernet framing assumed; loopback and PPP are not handled.
 - Detection is **signature / threshold-based** — no statistical baselining or machine learning.
 - Application-layer inspection is limited to the first 512 bytes of TCP payload on HTTP ports.
-- Up to **16 interfaces** and **64 watched ports** simultaneously (compile-time constants).
-- Log files grow unbounded within a day; add a `logrotate` rule if disk space is a concern.
+- Up to **16 interfaces** and **64 watched ports** simultaneously (adjustable via `maxInterfaces` and `maxWatchPorts` at compile time).
 - tigernet is a learning and monitoring tool. For production use consider Suricata or Zeek.
 
 ---
