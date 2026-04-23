@@ -118,6 +118,7 @@
 #define defSsdpAmpThreshold     50   /* UDP pkts to port 1900/window      */
 #define defFragFloodThreshold  100   /* IP fragments/window from one src  */
 #define defBruteThreshold        5
+#define defLogMaxMb              0   /* 0 = no size limit             */
 
 /* ── capacity limits ─────────────────────────────────────────────────── */
 #define maxTrackedIps    4096
@@ -176,6 +177,7 @@ typedef struct {
     int       confLoaded;
     char      alertScript[maxScriptPath];
     char      logDir[maxLogDirPath];
+    long      logMaxMb;       /* rotate when log exceeds this many MB; 0=off */
 
     WatchPort watchPorts[maxWatchPorts];
     int       watchCount;
@@ -315,12 +317,52 @@ static void todayLogPath(char *buf, size_t len) {
     snprintf(buf, len, "%s/%s.log", cfg.logDir, date);
 }
 
+/*
+ * Rotate today's log file when it exceeds cfg.logMaxMb megabytes.
+ * The full log is renamed  YYYYMMDD_1.log, YYYYMMDD_2.log, … until a free
+ * slot is found, then a fresh YYYYMMDD.log is started with a new header.
+ * Called with gLock held and only when logMaxMb > 0.
+ */
+static void rotateTodayLog(const char *path) {
+    char rotated[maxLogDirPath + 40];
+    /* strip the .log suffix to build the base name */
+    char base[maxLogDirPath + 20];
+    snprintf(base, sizeof(base), "%s", path);
+    char *dot = strrchr(base, '.');
+    if (dot) *dot = '\0';
+
+    for (int n = 1; n < 10000; n++) {
+        snprintf(rotated, sizeof(rotated), "%s_%d.log", base, n);
+        if (access(rotated, F_OK) != 0) {
+            if (rename(path, rotated) != 0)
+                fprintf(stderr, YELLOW "[tigernet] " RESET
+                        "log rotate: rename failed: %s\n", strerror(errno));
+            else
+                printf(DIM "[tigernet] rotated %s -> %s\n" RESET, path, rotated);
+            return;
+        }
+    }
+    fprintf(stderr, YELLOW "[tigernet] " RESET
+            "log rotate: no free slot found for %s, keeping current file\n", path);
+}
+
 static void writeLogEntry(const char *timestamp, const char *type,
                           const char *srcIp, const char *iface,
                           const char *detail) {
     if (cfg.logDir[0] == '\0') return;
     char path[maxLogDirPath + 20];
     todayLogPath(path, sizeof(path));
+
+    /* size-based rotation: check before opening */
+    if (cfg.logMaxMb > 0 && access(path, F_OK) == 0) {
+        struct stat st;
+        if (stat(path, &st) == 0) {
+            long limitBytes = cfg.logMaxMb * 1024L * 1024L;
+            if (st.st_size >= limitBytes)
+                rotateTodayLog(path);
+        }
+    }
+
     int newFile = (access(path, F_OK) != 0);
     FILE *f = fopen(path, "a");
     if (!f) {
@@ -514,6 +556,7 @@ static int loadConfig(Config *c) {
         else if (!strcmp(key,"watch"))        parseWatchSpec(c, val);
         else if (!strcmp(key,"alertScript")) snprintf(c->alertScript,sizeof(c->alertScript),"%s",val);
         else if (!strcmp(key,"logDir"))      snprintf(c->logDir,     sizeof(c->logDir),     "%s",val);
+        else if (!strcmp(key,"logMaxMb"))    c->logMaxMb = atol(val);
         else fprintf(stderr, YELLOW "[tigernet] " RESET
                 "conf:%d: unknown key '%s', skipped\n", lineNo, key);
     }
@@ -561,7 +604,9 @@ static void writeDefaultConfig(const char *path) {
         "# ifaceNoOsFp     = eth1   # suppress OS fingerprint on one interface\n"
         "#\n"
         "# alertScript = /etc/tigernet/alert_udp.sh\n"
-        "# logDir      = /var/log/tigernet\n#\n"
+        "# logDir      = /var/log/tigernet\n"
+        "# logMaxMb    = 0              # rotate log when it reaches N MB (0 = disabled)\n"
+        "#\n"
         "# watch = 22:SSH:%d\n"
         "# watch = 3389:RDP:%d\n"
         "# watch = 5900:VNC:%d\n",
@@ -1124,6 +1169,7 @@ static void printUsage(const char *prog) {
         "      --watch        <p:name:thr>  Watch port for brute-force (repeatable)\n"
         "      --alert-script <path>        Script to run on every alert\n"
         "      --log-dir      <dir>         Directory for YYYYMMDD.log files\n"
+        "      --log-max-mb   <n>           Rotate log when it exceeds N MB (default: 0=off)\n"
         "                                     (default: /var/log/tigernet)\n"
         "  -v, --verbose                    Print every packet event\n"
         "  -h, --help                       Show this help\n\n"
@@ -1151,6 +1197,7 @@ enum {
     optWatch = 1000, optAlertScript, optLogDir,
     optUdpFlood, optRstFlood, optFinFlood, optPingSweep,
     optDnsAmp, optNtpAmp, optSsdpAmp, optFragFlood,
+    optLogMaxMb,
     optNoBogon, optInternalIface,
     optNoAckScan, optNoFinScan, optNoMaimonScan, optNoOsFp,
     optIfaceNoAckScan, optIfaceNoFinScan, optIfaceNoMaimon, optIfaceNoOsFp
@@ -1174,6 +1221,7 @@ int main(int argc, char *argv[]) {
     cfg.ssdpAmpThreshold    = defSsdpAmpThreshold;
     cfg.fragFloodThreshold  = defFragFloodThreshold;
     snprintf(cfg.logDir, sizeof(cfg.logDir), "%s", defLogDir);
+    cfg.logMaxMb = defLogMaxMb;
 
     /* 2. config file path */
     const char *home = getenv("HOME");
@@ -1219,6 +1267,7 @@ int main(int argc, char *argv[]) {
         { "watch",          required_argument, NULL, optWatch        },
         { "alert-script",   required_argument, NULL, optAlertScript  },
         { "log-dir",      required_argument, NULL, optLogDir     },
+        { "log-max-mb",   required_argument, NULL, optLogMaxMb   },
         { "verbose",      no_argument,       NULL, 'v'           },
         { "help",         no_argument,       NULL, 'h'           },
         { NULL, 0, NULL, 0 }
@@ -1257,6 +1306,7 @@ int main(int argc, char *argv[]) {
             snprintf(cfg.alertScript, sizeof(cfg.alertScript), "%s", optarg); break;
         case optLogDir:
             snprintf(cfg.logDir, sizeof(cfg.logDir), "%s", optarg); break;
+        case optLogMaxMb:  cfg.logMaxMb = atol(optarg); break;
         case 'v': cfg.verbose = 1; break;
         case 'h': printUsage(argv[0]); return EXIT_SUCCESS;
         default:  printUsage(argv[0]); return EXIT_FAILURE;
@@ -1376,6 +1426,10 @@ int main(int argc, char *argv[]) {
     if (cfg.logDir[0] != '\0') {
         char tp[maxLogDirPath + 20]; todayLogPath(tp, sizeof(tp));
         printf("Today's log  : %s\n", tp);
+        if (cfg.logMaxMb > 0)
+            printf("Log max size : %ld MB (rotate on exceed)\n", cfg.logMaxMb);
+        else
+            printf("Log max size : " DIM "unlimited" RESET "\n");
     }
     /* scan-check suppression status */
     {

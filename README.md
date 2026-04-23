@@ -542,6 +542,7 @@ Example output:
 - All per-source-IP state lives in a **hash table** (4096 buckets, chained).
 - Alert scripts run via **double-fork + `setsid()`** — never blocks, no zombies.
 - Log files are opened, written, and **closed per alert** — midnight rotation is automatic.
+- **Size-based rotation**: when `logMaxMb > 0`, the file size is checked with `stat()` before each write. If the limit is met, the file is renamed `YYYYMMDD_1.log` (suffix increments until a free slot is found) and a fresh file is started — no background thread or timer needed.
 - Ctrl+C calls `pcap_breakloop()` on every open handle; all threads exit cleanly.
 
 ---
